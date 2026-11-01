@@ -1,0 +1,106 @@
+name: vdeplug-go (netstack vde_plug)
+
+on:
+  push:
+    paths:
+      - 'vdeplug-go/**'
+      - '.github/workflows/vdeplug_go.yml'
+  schedule:
+    # Weekly canary: build + test against the latest module versions.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Float deps to upstream latest
+        # go.mod cannot express "track latest" (Go pins exact versions), so
+        # resolve to the newest stable of every module at build time.
+        # gVisor floats to the `go` branch — upstream's auto-generated
+        # pure-Go tree, synced minutes after every master push — rather
+        # than the Bazel-first master, which intermittently ships a stray
+        # bridge_test.go that breaks Go module builds.
+        # The committed go.mod is the known-good floor for local dev.
+        run: |
+          go get -u ./...
+          go get gvisor.dev/gvisor@go
+          go mod tidy
+        working-directory: vdeplug-go
+
+      - name: Vet
+        run: go vet ./...
+        working-directory: vdeplug-go
+
+      - name: Unit + e2e (fleet boot/switching/failover)
+        # The e2e test is self-contained: it builds the binary itself and
+        # drives fake guests over socketpairs — no UML kernel, no root.
+        # The direct-mode tests drive the D8 TCP wire (kernel role) with
+        # the production link bridge: DHCP lease + NAT44 HTTP round-trip.
+        run: go test -timeout 120s -v ./...
+        working-directory: vdeplug-go
+
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            cgo: 0
+          - target: arm64
+            runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            cgo: 0
+          - target: android-arm64
+            runner: ubuntu-24.04
+            goos: android
+            goarch: arm64
+            cgo: 0
+          # M5.1b: netstack.exe — the uml-nt helper (D8 direct TCP wire;
+          # uplink slirp only, no fleet/tap on windows).
+          - target: windows-x86_64
+            runner: ubuntu-24.04
+            goos: windows
+            goarch: amd64
+            cgo: 0
+            out: netstack.exe
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Float deps to upstream latest
+        # gVisor floats to the pure-Go `go` branch, not the Bazel-first
+        # master — see the test job's float step.
+        run: |
+          go get -u ./...
+          go get gvisor.dev/gvisor@go
+          go mod tidy
+        working-directory: vdeplug-go
+
+      - name: Build static vde_plug (${{ matrix.target }})
+        run: |
+          OUT="${{ matrix.out || 'vde_plug' }}"
+          CGO_ENABLED=${{ matrix.cgo }} GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags="-s -w" -o "$OUT" .
+          file "$OUT" && ls -lh "$OUT"
+        working-directory: vdeplug-go
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: vdeplug-go-${{ matrix.target }}
+          path: vdeplug-go/${{ matrix.out || 'vde_plug' }}
