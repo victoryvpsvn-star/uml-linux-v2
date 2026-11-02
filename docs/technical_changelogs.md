@@ -673,6 +673,35 @@ boots with `dhcp4: true` by default (no static address baked in).
 
 Reverse-chronological, one line per user-visible change.
 
+**CI — the uml-nt all-in-one workflow**
+
+- this commit — **D33 (the fan-out)**: the launcher job's 15 serial
+  boot gates became a parallel `core`/`apps`/`net`/`dyn` matrix
+  (`win-gates`), with the gate bodies extracted VERBATIM into
+  `uml-nt/ci/gates.sh` (one subshell per gate — a gate's `exit 1`
+  fails that gate, never the battery; portfwd keeps its
+  continue-on-error contract as a soft probe; shellcheck-linted by
+  the unit job). The Windows toolset (launcher.exe + stub.exe +
+  netstack.exe) is built once in `winbuild` and downloaded by every
+  leg; the `uml-nt-windows-bin` archive is now FLAT (three exes at
+  the root — unzip next to vmlinux.elf and run). Plus: a concurrency
+  group cancels superseded pushes, every job got a `timeout-minutes`,
+  kernel-job intermediates and the windows toolset get 14-day
+  retention (was the 90-day default), the unit job's three apt rounds
+  merged into one, and the gate groups write a verdict table (with
+  mean_ns / eps) into the run summary.
+- `4952e69` D32 — the referee's prep degrades to a clean skip: with
+  no live `uml-base-debian-bookworm` artifact, rootfs-mask reports
+  `base_ready=false` and ends green, systemd-boot reads the output
+  and skips — a fresh fork's dispatch no longer paints red.
+- `e854fdd` M5.1e — host→guest port forwarding natively: one
+  config.yaml next to netstack.exe is the whole wiring; an evidence
+  probe (soft), not a gate.
+- `621723f` the four per-milestone workflows (m0 / tests / m3 / m55)
+  merged into ONE file (`uml-nt.yml`) — one vmlinux, one launcher
+  build per run, dispatch levers preserved, weekly canary inert until
+  the series lands on the default branch.
+
 **Network helper — Go rewrite (vdeplug-go)**
 
 - `0827389` docs/distributed.md; helpers/ replaces cmd/ for the aux tools
