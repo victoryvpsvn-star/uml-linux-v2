@@ -1,0 +1,1273 @@
+name: uml-nt build (all-in-one)
+
+# ONE workflow for the whole uml-nt pipeline — the four former
+# per-milestone files merged into a single DAG:
+#
+#   uml-nt-m0.yml           -> spikes         M0 S1-S6 evidence probes (win)
+#   uml-nt-tests.yml        -> unit           model tests + ABI + pin + lint (linux)
+#   uml-nt-m3.yml           -> kernel         vmlinux + guest-init.elf + rootfs.ext4 (linux)
+#                                            launcher — the native gate battery (win)
+#   uml-nt-m55-systemd.yml  -> rootfs-mask    masked bookworm CI copy (linux)
+#                                            systemd-boot — the M5.5a/M5.5b referee (win)
+#
+# One binary, one build: the old m3 and m55 lanes each built their own
+# vmlinux and their own launcher.exe + stub.exe on every push — the
+# merge builds each exactly once per run and both Windows jobs consume
+# the same vmlinux artifact.
+#
+# Triggers preserve the old split:
+#   push uml-nt/**  -> unit + spikes + kernel + launcher (the old
+#                      m0+tests+m3 lanes; CI stays fast, no referee);
+#   dispatch        -> everything above PLUS systemd-boot, with the
+#                      old m55 A/B levers (debugger / veh_window /
+#                      feed / xs_lever / probe_off / witness_off) and
+#                      rebuild_base (D34: force a fresh base image);
+#   weekly cron     -> the M5.5 plan ("flip to a weekly canary once
+#                      multi-user.target is green"): schedule events
+#                      only fire on the default branch, so this stays
+#                      INERT while the series lives on uml-nt/* and
+#                      arms itself the moment it lands on main;
+#   vars.UML_NT_BOOT_ON_PUSH == '1' -> the one-switch flip that puts
+#                      the referee on every push, no new commit.
+# The old m55 "push: paths: [itself]" registration trick is gone —
+# this file fires on every push anyway, so the dispatch entry is
+# guaranteed.
+#
+# D33 (the fan-out): the old launcher job ran its 15 boot gates
+# SERIALLY on one runner — ~20 min of wall time in which any red gate
+# silently SKIPPED every gate after it (run 41325340080: a one-second
+# boot death skipped 12 steps of evidence). The lane is now two jobs:
+# winbuild (launcher + stub + netstack + the no-kernel probes, uploaded
+# once — flat) and win-gates (a core/apps/net/dyn matrix running the
+# VERBATIM gate bodies out of uml-nt/ci/gates.sh in parallel,
+# fail-fast off so a red group never hides its siblings' evidence).
+# New plumbing only: the gates' commands, timeouts and marker contracts
+# are byte-identical (gates.sh is shellcheck-linted by the unit job).
+#
+# D32 (the missing-artifact contract): dispatch on a repo with no live
+# uml-base-debian-bookworm artifact no longer paints the run red —
+# rootfs-mask reports base_ready=false and ends green, systemd-boot
+# reads the output and skips itself. (In D34 practice this became the
+# expiry-race safety net: the base is BUILT in-run when missing.)
+#
+# D34 (one file owns the pipeline end to end): base_image.yml is folded
+# in as the base-image job — the LAST cross-workflow dependency is gone
+# and this is the ONLY workflow file in the repo (the 11 upstream
+# kernel/distro CI files went with the lanes they fed; their history
+# stays in docs/technical_changelogs.md). The job probes for a live
+# uml-base-debian-bookworm artifact first:
+#   present + no lever  -> reuse it (mask runs in seconds, as before);
+#   missing             -> build it in-run (the old base_image.yml
+#                          recipe verbatim, the debian/bookworm/amd64
+#                          leg — the ONE pair the referee consumes; the
+#                          15-image distro matrix fed deleted workflows);
+#   rebuild_base lever
+#   or weekly canary    -> rebuild (the old base_image.yml cadence;
+#                          retention 90d keeps it armed between runs).
+# A dispatch on a fresh fork now arms the referee ITSELF — one run,
+# zero manual prerequisites.
+#
+# The referee's contract (verbatim from the m55 lane): boot-failure-
+# driven — every run prints the not-implemented syscall table + the
+# furthest systemd marker; the gate tightens as clusters land. Gate
+# (D21 era): multi-user.target, fallback journald Started (the
+# env-poison SIGSEGV flake family still kills ~1/3 of boots
+# pre-journald — a red flake run is re-dispatched for sampling, not
+# treated as a regression). Rootfs: base-debian-bookworm.img (Debian 12,
+# glibc 2.36 + systemd 252) — from the base-image job's artifact, built
+# in-run when missing (D34), never committed (hard rule). Wine
+# cannot pass the arch_prctl wall (HANDOFF 4.1-11 — the c3 wine boots
+# die there, rax=9e, after the whole loader chain maps clean), so
+# native is the referee for everything past the guest loader chain.
+
+on:
+  push:
+    branches: ["uml-nt/**"]
+  workflow_dispatch:
+    inputs:
+      debugger:
+        description: "uml_nt_dbg=1 (run stub.exe under the launcher's own mini-debugger)"
+        type: boolean
+        default: false
+      veh_window:
+        description: 'Refined A/B: remove the vectored handler for the first 4s of a login conn'
+        type: boolean
+        default: false
+      feed:
+        description: "feed the console at all (false = diagnostic A/B: is the input path the killer?)"
+        type: boolean
+        default: true
+      xs_lever:
+        description: "drop CONTEXT_XSTATE for the login chain only (ruling 223 A/B)"
+        type: boolean
+        default: false
+      probe_off:
+        description: "append uml_nt_drexec=0 (A/B: the DR-execute probe off)"
+        type: boolean
+        default: false
+      witness_off:
+        description: "append uml_nt_witness=0 (exonerate guest-visible witnesses)"
+        type: boolean
+        default: false
+      rebuild_base:
+        description: "build a fresh uml-base-debian-bookworm rootfs first (D34; otherwise reused from artifacts / built only when missing)"
+        type: boolean
+        default: false
+  schedule:
+    # Weekly canary (Mon 04:00 UTC) — inert until the series lands on
+    # the default branch; see the header.
+    - cron: "0 4 * * 1"
+
+concurrency:
+  # One live run per ref: a burst of pushes no longer piles up
+  # Windows runners (the slow half of the lane). Superseded PUSHES are
+  # cancelled; a dispatch or the weekly canary never cancels anything
+  # (and the canary fires on the default branch only, where pushes do
+  # not land).
+  group: uml-nt-all-in-one-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # One bounded apt round (the kernel job's rule — a stuck mirror
+      # once ate 17 min of "Install deps"): lld+llvm feed the M3.4 ELF
+      # fixture build, musl-tools the rootfs busybox (S4c2), the mingw
+      # cross the ntabi PE checks. Was three separate rounds.
+      - name: Install deps
+        timeout-minutes: 8
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+            update -y
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+            install -y lld llvm musl-tools gcc-mingw-w64-x86-64
+
+      - name: Unit tests (pure logic, no network)
+        run: |
+          bash uml-nt/tests/test_fetch.sh
+          bash uml-nt/tests/test_os_windows_skeleton.sh
+          bash uml-nt/tests/test_scan_patch.sh
+          bash uml-nt/tests/test_mm.sh
+          # 100-real-alpine: console-status classifier — the stdin
+          # reader must survive the spurious WAIT_1-class wakes
+          bash uml-nt/tests/test_console.sh
+          # M5.6a slice D: the replay single-step (TF) state machine
+          bash uml-nt/tests/test_ss.sh
+          # M5.6a D28 (Shelley lazy-file ruling): the demand-paged
+          # file-VMA run window + file read clamp.
+          bash uml-nt/tests/test_lazyfile.sh
+          # M5.6a D28 follow-up: the run-keyed kernel->guest write ledger
+          # the [imgwatch] fire scans (writer identification).
+          bash uml-nt/tests/test_writeledger.sh
+          # M5.6a writer-hunt follow-up (Shelley 148-UPDATE 3/4): the
+          # trap -> resume boundary contract — only the ud2 sentinel is
+          # a syscall; every resume lands on the claimed boundary.
+          bash uml-nt/tests/test_resume.sh
+          # M5.6a login-depth follow-up (Shelley 148-UPDATE 9/10): the
+          # guest TLS pointer-guard contract — PTR_MANGLE arithmetic,
+          # guard-stability verdict, AT_RANDOM -> TCB derivation.
+          bash uml-nt/tests/test_guard.sh
+          # M3.7 uaccess walker (D15) over the vma tree
+          bash uml-nt/tests/test_uaccess.sh
+          # M4.1 bench stats — the pure math the freestanding kernel
+          # ships must match the host test (sort/percentile/mean/eps)
+          bash uml-nt/tests/test_bench.sh
+          # M3.4 guest ELF loader — the real-fixture build needs lld
+          # (same clang+lld recipe as the kernel job's guest build).
+          bash uml-nt/tests/test_elf.sh
+          # M3.8 S4c: the rootfs now carries /bin/step2 (the exec-
+          # chain proof binary) built from ../guest/step2.c — build
+          # the guest targets before the image, same order as the
+          # kernel job.
+          make -C uml-nt/guest CC=clang LD=ld.lld
+          # M3.5 gate rootfs — static freestanding /sbin/init + ext4
+          # image (mke2fs -d, no root). Same recipe the kernel job's
+          # mount gate consumes. S4c2: the image also carries busybox
+          # (built from source, musl-gcc).
+          make -C uml-nt/rootfs
+          debugfs -R "ls -l /sbin" uml-nt/rootfs/rootfs.ext4
+          debugfs -R "ls -l /bin" uml-nt/rootfs/rootfs.ext4
+
+      - name: ntabi ABI checks (ELF freestanding + mingw PE)
+        run: bash uml-nt/tests/test_ntabi.sh
+
+      - name: Pin check (network, cheap — validates tarball + file URLs + sha256 pin)
+        run: bash uml-nt/kernel/fetch.sh check
+
+      - name: Lint shell
+        run: |
+          shellcheck -x uml-nt/kernel/fetch.sh uml-nt/tests/test_fetch.sh \
+            uml-nt/tests/test_os_windows_skeleton.sh uml-nt/tests/test_scan_patch.sh \
+            uml-nt/tests/test_mm.sh uml-nt/tests/test_elf.sh \
+            uml-nt/tests/test_uaccess.sh uml-nt/tests/test_bench.sh \
+            uml-nt/tests/test_console.sh uml-nt/tests/test_ss.sh \
+            uml-nt/tests/test_lazyfile.sh uml-nt/tests/test_writeledger.sh \
+            uml-nt/tests/test_resume.sh uml-nt/tests/test_guard.sh \
+            uml-nt/ci/gates.sh
+
+  spikes:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            make
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-clang
+            mingw-w64-x86_64-lld
+
+      - name: Build spikes
+        shell: msys2 {0}
+        run: make -C uml-nt/spikes all
+
+      - name: Run S1 — VEH trap/resume
+        shell: msys2 {0}
+        run: |
+          mkdir -p uml-nt/spikes/results
+          cd uml-nt/spikes
+          ./s1_veh.exe && cat results/s1_veh.json
+
+      - name: Run S2 — cross-process sync
+        shell: msys2 {0}
+        run: |
+          cd uml-nt/spikes
+          ./s2_xproc.exe && cat results/s2_xproc.json
+
+      - name: Run S5 — spawn/discard/fixed-map
+        shell: msys2 {0}
+        run: |
+          cd uml-nt/spikes
+          ./s5_spawn.exe && cat results/s5_spawn.json
+
+      - name: Run S3+S4 — ELF launcher
+        shell: msys2 {0}
+        run: |
+          cd uml-nt/spikes
+          ./s3_launcher.exe payload.elf && cat results/s3_launcher.json
+
+      - name: Run S6 — ud2 scanner (no objdump ground truth on Windows)
+        shell: msys2 {0}
+        run: |
+          cd uml-nt/spikes
+          ./s6_scan.exe payload.elf > results/s6_scan.json && cat results/s6_scan.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m0-spike-results
+          path: |
+            uml-nt/spikes/results/*.json
+          if-no-files-found: warn
+
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # One bounded apt round (a stuck mirror once ate 17 min of
+      # "Install deps" and the run was cancelled): musl-tools for the
+      # rootfs busybox and ccache for the kernel ride along here.
+      - name: Install deps
+        timeout-minutes: 8
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+            update -y
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+            install -y build-essential flex bison bc patch xz-utils \
+            clang lld llvm ccache musl-tools
+
+      # ccache across runs: the tree and O= paths are fixed on the
+      # runner, so an overlay-only change recompiles just the touched
+      # objects. The key rolls per commit; restore picks the newest.
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: uml-nt-ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            uml-nt-ccache-${{ runner.os }}-
+
+      - name: Fetch pinned v6.18.56 + apply uml-nt overlay
+        run: |
+          TREE=$(bash uml-nt/kernel/fetch.sh extract)
+          bash uml-nt/kernel/apply.sh "$TREE"
+          echo "TREE=$TREE" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=2G" >> "$GITHUB_ENV"
+          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
+          # fresh extract = fresh mtimes; hash contents, not stat
+          echo "CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime" >> "$GITHUB_ENV"
+
+      - name: Configure (uml_nt_defconfig, clang+lld)
+        run: |
+          make -C "$TREE" O="$(pwd)/build" ARCH=um LLVM=1 CC="ccache clang" \
+            LD=ld.lld uml_nt_defconfig
+
+      - name: Build vmlinux (clang+lld, ccache)
+        run: |
+          ccache -z
+          make -C "$TREE" O="$(pwd)/build" ARCH=um LLVM=1 CC="ccache clang" \
+            LD=ld.lld KBUILD_BUILD_TIMESTAMP="uml-nt" -j"$(nproc)"
+          ccache -s
+
+      - name: Freestanding gates (D1/D2)
+        run: |
+          set -euxo pipefail
+          test -f build/vmlinux
+          # D1: zero host-libc references may remain undefined or dynamic.
+          [ "$(nm -u build/vmlinux | wc -l)" -eq 0 ]
+          ! readelf -d build/vmlinux | grep -q NEEDED
+          # D2/D9: entry point is our _start (launcher jumps there).
+          ENTRY=$(readelf -h build/vmlinux | awk '/Entry point/ {print $4}')
+          # readelf prints 0x60022d1f; nm pads to 16 digits — match both.
+          nm build/vmlinux | grep -qiE "0*${ENTRY#0x} T _start"
+
+      - name: Upload vmlinux.elf
+        uses: actions/upload-artifact@v4
+        with:
+          name: uml-nt-vmlinux-elf
+          path: build/vmlinux
+          # D33: intermediates pair with the windows-bin download —
+          # 14 days bounds the storage bill without orphaning the
+          # "matching-version" pairing (was the 90-day default).
+          retention-days: 14
+
+      # M3.4: the probe guest — a real static ELF64 the kernel-side
+      # loader loads (execveat(memfd) analogue). Same toolchain as the
+      # kernel build; uploaded for the native launcher job.
+      - name: Build probe guest ELF
+        run: |
+          make -C uml-nt/guest CC=clang LD=ld.lld
+          readelf -lW uml-nt/guest/guest-init.elf
+          test -f uml-nt/guest/guest-init.elf
+
+      - name: Upload guest-init.elf
+        uses: actions/upload-artifact@v4
+        with:
+          name: uml-nt-guest-exec-elf
+          path: uml-nt/guest/guest-init.elf
+          # D33: intermediates pair with the windows-bin download —
+          # 14 days bounds the storage bill without orphaning the
+          # "matching-version" pairing (was the 90-day default).
+          retention-days: 14
+
+      # M3.5: minimal ext4 root image (static freestanding /sbin/init
+      # built from uml-nt/rootfs/init.c, populated via mke2fs -d — no
+      # root, no loop device). Uploaded for the native mount gate.
+      - name: Build gate rootfs (M3.5)
+        run: |
+          # musl-gcc (Install deps) builds the image's busybox (S4c2)
+          make -C uml-nt/rootfs
+          file uml-nt/rootfs/rootfs.ext4
+
+      - name: Upload rootfs.ext4
+        uses: actions/upload-artifact@v4
+        with:
+          name: uml-nt-rootfs-ext4
+          path: uml-nt/rootfs/rootfs.ext4
+          # D33: intermediates pair with the windows-bin download —
+          # 14 days bounds the storage bill without orphaning the
+          # "matching-version" pairing (was the 90-day default).
+          retention-days: 14
+
+  base-image:
+    # D34: the old base_image.yml folded in — this file is now the
+    # ONLY workflow in the repo and owns the referee's rootfs end to
+    # end. It builds exactly the one image the m55 referee consumes:
+    # uml-base-debian-bookworm (Debian 12, amd64, systemd 252, glibc
+    # 2.36). The old 16-pair distro matrix fed the deleted upstream
+    # workflows (stable.yml, lts_*.yml, bionic_android.yml ...) — it
+    # went with them.
+    #
+    # Probe first, build only when needed (the probe costs ~30s):
+    #   no live uml-base-debian-bookworm artifact -> BUILD — a fresh
+    #     fork arms the referee with ONE dispatch, no prerequisite run;
+    #   rebuild_base lever or the weekly canary   -> BUILD (refresh —
+    #     the old base_image.yml weekly cadence);
+    #   otherwise                                -> reuse the stored
+    #     artifact; rootfs-mask's own lookup downloads it as before.
+    # Same referee-lane condition as rootfs-mask/systemd-boot: a plain
+    # push never pays for it.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || vars.UML_NT_BOOT_ON_PUSH == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # One bounded apt round (the kernel job's stuck-mirror rule).
+      - name: Install deps
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+            update -y
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+            install -y curl wget xz-utils e2fsprogs
+
+      # Probe: newest NON-EXPIRED uml-base-debian-bookworm artifact via
+      # the artifacts API — the SAME lookup rootfs-mask uses (the
+      # `gh run list --workflow` filter trap is documented there).
+      - name: Probe for a live base artifact
+        id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RID=$(gh api \
+            "repos/${{ github.repository }}/actions/artifacts?name=uml-base-debian-bookworm&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | .[-1].workflow_run.id')
+          echo "artifact lookup: ${RID:-EMPTY}"
+          if [ -z "$RID" ]; then
+            echo "BUILD_BASE=1" >> "$GITHUB_ENV"
+            echo "decision: no live uml-base-debian-bookworm artifact — building it (D34 auto-arm)"
+          elif [ "${{ inputs.rebuild_base }}" = "true" ] \
+               || [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "BUILD_BASE=1" >> "$GITHUB_ENV"
+            echo "decision: refresh — rebuilding over run $RID's artifact"
+          else
+            echo "BUILD_BASE=0" >> "$GITHUB_ENV"
+            echo "decision: reuse the live artifact from run $RID (rootfs-mask downloads it)"
+          fi
+
+      # ---- The old base_image.yml recipe from here down, the
+      # ---- debian/bookworm/amd64 leg, step bodies verbatim (the
+      # ---- family-detect step resolved to its Debian branch: apt /
+      # ---- ssh / lib/systemd/system / "openssh-server iproute2
+      # ---- iputils-ping").
+      - name: Download cloud-variant rootfs
+        if: env.BUILD_BASE == '1'
+        run: |
+          URL_PATH=$(curl -s http://images.linuxcontainers.org/meta/1.0/index-system \
+            | grep -v edge \
+            | awk '-F;' -v d="debian" -v r="bookworm" -v a="amd64" \
+              '(($1==d) && ($2==r) && ($3==a) && ($4=="cloud")) {print $NF}')
+          if [ -z "$URL_PATH" ]; then
+            echo "::error::No cloud variant found for debian bookworm amd64"
+            exit 1
+          fi
+          wget -O rootfs.tar.xz \
+            "http://images.linuxcontainers.org${URL_PATH}rootfs.tar.xz"
+          echo "Rootfs: ${URL_PATH}rootfs.tar.xz"
+          sha256sum rootfs.tar.xz
+          SERIAL=$(echo "$URL_PATH" | grep -oE '[0-9]{8}_[0-9]{2}:[0-9]{2}')
+          echo "SERIAL=$SERIAL" >> "$GITHUB_ENV"
+
+      - name: Create ext4 image
+        if: env.BUILD_BASE == '1'
+        run: |
+          dd if=/dev/zero of=base.img bs=1M count=1024 status=progress
+          mkfs.ext4 -F -L rootfs base.img
+
+      - name: Populate rootfs
+        if: env.BUILD_BASE == '1'
+        run: |
+          sudo mkdir /mnt/rootfs
+          sudo mount -o loop base.img /mnt/rootfs
+          sudo tar -xf rootfs.tar.xz -C /mnt/rootfs
+
+      - name: Install packages
+        if: env.BUILD_BASE == '1'
+        run: |
+          sudo mount -t proc proc /mnt/rootfs/proc
+          sudo mount --bind /dev /mnt/rootfs/dev
+          sudo rm -f /mnt/rootfs/etc/resolv.conf
+          echo 'nameserver 1.1.1.1' | sudo tee /mnt/rootfs/etc/resolv.conf
+          sudo chroot /mnt/rootfs apt-get update -qq || \
+            sudo chroot /mnt/rootfs apt update -qq || true
+          sudo chroot /mnt/rootfs apt install -y -q \
+            openssh-server iproute2 iputils-ping
+          sudo umount /mnt/rootfs/dev
+          sudo umount /mnt/rootfs/proc
+
+      - name: Configure system
+        if: env.BUILD_BASE == '1'
+        run: |
+          # root password
+          sudo chroot /mnt/rootfs bash -c 'echo "root:root" | chpasswd'
+
+          # hostname
+          echo 'uml' | sudo tee /mnt/rootfs/etc/hostname
+          sudo tee /mnt/rootfs/etc/hosts >/dev/null <<'HOSTS'
+          127.0.0.1   localhost localhost.localdomain
+          127.0.1.1   uml
+          HOSTS
+
+          # getty on tty0 (console login)
+          sudo ln -sf /lib/systemd/system/getty@.service \
+            /mnt/rootfs/etc/systemd/system/getty.target.wants/getty@tty0.service
+
+          # fstab (UML block device)
+          sudo tee /mnt/rootfs/etc/fstab >/dev/null <<'FSTAB'
+          /dev/ubda   /       ext4    defaults    0 1
+          proc        /proc   proc    defaults    0 0
+          sysfs       /sys    sysfs   defaults    0 0
+          tmpfs       /run    tmpfs   nosuid,nodev,size=50%,mode=755  0 0
+          FSTAB
+
+          # sysprep (image generalisation)
+          sudo cp rootfs/sysprep /mnt/rootfs/usr/bin/sysprep
+          sudo chmod +x /mnt/rootfs/usr/bin/sysprep
+
+          # SSH host-key regeneration on first boot
+          sudo cp rootfs/ssh-keygen.service /mnt/rootfs/etc/systemd/system/
+          sudo chroot /mnt/rootfs systemctl enable ssh-keygen
+
+          # sshd service name (Debian family: ssh)
+          sudo chroot /mnt/rootfs systemctl enable ssh
+
+      - name: Configure networking (cloud-init NoCloud)
+        if: env.BUILD_BASE == '1'
+        run: |
+          # Remove any pre-existing network configs that fight cloud-init
+          sudo rm -f /mnt/rootfs/etc/netplan/*.yaml
+          sudo rm -f /mnt/rootfs/etc/systemd/network/*.network
+          sudo rm -f /mnt/rootfs/etc/sysconfig/network-scripts/ifcfg-*
+          sudo rm -f /mnt/rootfs/etc/NetworkManager/system-connections/cloud-init-eth0.nmconnection
+
+          # Remove cloud-init.disabled (LXC sets it on EL)
+          sudo rm -f /mnt/rootfs/etc/cloud/cloud-init.disabled
+
+          # Bake NoCloud seed into the image
+          sudo mkdir -p /mnt/rootfs/var/lib/cloud/seed/nocloud
+          sudo cp rootfs/nocloud/meta-data \
+                  rootfs/nocloud/network-config \
+                  rootfs/nocloud/user-data \
+                  /mnt/rootfs/var/lib/cloud/seed/nocloud/
+
+          # Enable cloud-init services manually (generator needs a volume)
+          UNITPATH=lib/systemd/system
+          sudo mkdir -p /mnt/rootfs/etc/systemd/system/sysinit.target.wants
+          sudo mkdir -p /mnt/rootfs/etc/systemd/system/multi-user.target.wants
+          sudo ln -sf "/${UNITPATH}/cloud-init-local.service" \
+            /mnt/rootfs/etc/systemd/system/sysinit.target.wants/cloud-init-local.service
+          for svc in cloud-init cloud-config cloud-final; do
+            sudo ln -sf "/${UNITPATH}/${svc}.service" \
+              /mnt/rootfs/etc/systemd/system/multi-user.target.wants/${svc}.service
+          done
+
+          # Mask wait-online (hangs on Debian, unneeded — cloud-init handles timing)
+          sudo ln -sf /dev/null \
+            /mnt/rootfs/etc/systemd/system/systemd-networkd-wait-online.service
+
+          # Enable network services
+          sudo chroot /mnt/rootfs systemctl enable systemd-networkd 2>/dev/null || true
+          sudo chroot /mnt/rootfs systemctl enable systemd-resolved 2>/dev/null || true
+
+          # resolv.conf → resolved stub (if resolved is enabled)
+          if [ -f /mnt/rootfs/etc/systemd/system/multi-user.target.wants/systemd-resolved.service ]; then
+            sudo rm -f /mnt/rootfs/etc/resolv.conf
+            sudo ln -sf /run/systemd/resolve/stub-resolv.conf \
+              /mnt/rootfs/etc/resolv.conf
+          fi
+
+      - name: Sysprep & finalise
+        if: env.BUILD_BASE == '1'
+        run: |
+          # Empty machine-id → regenerated on first boot
+          sudo rm -f /mnt/rootfs/etc/machine-id
+          sudo touch /mnt/rootfs/etc/machine-id
+
+          # APT cleanup
+          sudo chroot /mnt/rootfs apt clean all 2>/dev/null || \
+            sudo chroot /mnt/rootfs apt-get clean 2>/dev/null || true
+          sudo rm -rf /mnt/rootfs/var/lib/apt/lists/*
+
+          # Remove SSH host keys (regenerated by ssh-keygen.service)
+          sudo rm -f /mnt/rootfs/etc/ssh/ssh_host_*
+
+          # Clear logs
+          sudo find /mnt/rootfs/var/log -type f -exec sudo truncate -s 0 {} \;
+
+          # Clear cloud-init runtime state (seed stays, instance data goes)
+          sudo rm -rf /mnt/rootfs/var/lib/cloud/data/* \
+                      /mnt/rootfs/var/lib/cloud/instance/*
+
+          # Zero-fill free space
+          sudo dd if=/dev/zero of=/mnt/rootfs/ZERO bs=1M status=none || true
+          sudo rm -f /mnt/rootfs/ZERO
+          sudo sync
+          sudo umount /mnt/rootfs
+
+      - name: Sparsify & name
+        if: env.BUILD_BASE == '1'
+        run: |
+          # Uploaded uncompressed: GitHub zips artifact downloads anyway.
+          OUT=base-debian-bookworm.img
+          cp --sparse=always base.img "$OUT"
+          echo "$(date -u +%Y-%m-%d) arch=amd64 distro=debian release=bookworm rootfs=${{ env.SERIAL }}" \
+            > VERSION
+          ls -lh "$OUT" VERSION
+
+      - uses: actions/upload-artifact@v4
+        if: env.BUILD_BASE == '1'
+        with:
+          name: uml-base-debian-bookworm
+          path: |
+            base-debian-bookworm.img
+            VERSION
+          # 90d (not the old 30): the referee must stay armed between
+          # weekly canaries; the probe rebuilds on expiry anyway.
+          retention-days: 90
+
+  rootfs-mask:
+    # The referee's image prep (was the m55 kernel job's second half),
+    # pulled into its own job so a missing base-debian-bookworm
+    # artifact skips systemd-boot instead of taking the whole
+    # build+gates lane down with it. Masking touches the CI COPY
+    # only — the canonical base artifact stays pristine.
+    # Same condition as systemd-boot: on a plain push the masked
+    # copy would be uploaded for nobody.
+    #
+    # D34: needs base-image above — the artifact is built in-run when
+    # missing, so by the time this job runs a live one exists (a
+    # failed build skips this job via needs and the run goes red for
+    # the REAL reason). D32's empty-lookup path stays below as the
+    # expiry-race safety net.
+    #
+    # D32 (the missing-artifact contract): the job's OWN comment said
+    # "a missing artifact skips systemd-boot" — but the lookup used to
+    # exit 1, painting the whole dispatch red on any repo without a
+    # live uml-base-debian-bookworm artifact (a fresh fork, an expired
+    # retention window). The lookup now reports base_ready=false and
+    # ends GREEN with the marker "REFeree-SKIP: no live base image"
+    # printed; systemd-boot reads the output and skips itself. The
+    # run's verdict then says "everything that could run, passed" —
+    # which is exactly what the design promised.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || vars.UML_NT_BOOT_ON_PUSH == '1'
+    needs: [base-image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      base_ready: ${{ steps.mask.outputs.base_ready }}
+    steps:
+      - name: Download base-debian-bookworm rootfs + mask cloud-init (D21 test-image rule)
+        id: mask
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Newest NON-EXPIRED uml-base-debian-bookworm artifact via the
+          # artifacts API (`gh run list --workflow` filters by the current
+          # git branch and can return a base_image run that never uploaded
+          # the artifact — run 36841223033 died on that).
+          RID=$(gh api \
+            "repos/${{ github.repository }}/actions/artifacts?name=uml-base-debian-bookworm&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | .[-1].workflow_run.id')
+          echo "artifact lookup: ${RID:-EMPTY}"
+          if [ -z "$RID" ]; then
+            echo "base_ready=false" >> "$GITHUB_OUTPUT"
+            echo "REFeree-SKIP: no live uml-base-debian-bookworm artifact — systemd-boot will skip (the base-image job above re-arms on the next run)" >&2
+            exit 0
+          fi
+          echo "base_image run: $RID"
+          gh run download "$RID" -R "${{ github.repository }}" \
+            -n uml-base-debian-bookworm -D rootfs-img
+          ls -lh rootfs-img
+          # D21 test-image rule (ARCHITECTURE.md): cloud-init units are
+          # provisioning fluff for this gate and exec python3.11 (6.8MB
+          # ET_EXEC at low VAs — the D21 loader blocker: order-11 span >
+          # MAX_PAGE_ORDER). Mask = canonical systemd /dev/null symlink in
+          # /etc/systemd/system (shadows the unit wherever its wants-dir
+          # link lives). D21 lifts these.
+          IMG=rootfs-img/base-debian-bookworm.img
+          sudo mkdir -p /mnt/m55a-rootfs
+          sudo mount -o loop "$IMG" /mnt/m55a-rootfs
+          for unit in cloud-init.service cloud-init-local.service \
+                      cloud-config.service cloud-final.service \
+                      systemd-cloud-init.service; do
+            if [ -e "/mnt/m55a-rootfs/lib/systemd/system/$unit" ] \
+               || [ -L "/mnt/m55a-rootfs/etc/systemd/system/$unit" ]; then
+              sudo ln -sf /dev/null "/mnt/m55a-rootfs/etc/systemd/system/$unit"
+              echo "masked: $unit"
+            else
+              echo "not present, skipped: $unit"
+            fi
+          done
+          echo "--- masked units in /etc/systemd/system ---"
+          ls -l /mnt/m55a-rootfs/etc/systemd/system/ | grep -i cloud || true
+          # M5.5b-1 (gate 1/3 of the M5.5b milestone, test-image rule):
+          # the defconfig has NO CONFIG_VT/UNIX98_PTYS — /dev/tty1
+          # cannot exist, so getty@tty1 can only restart-loop. The
+          # console IS a real tty on uml-nt (console.c tty_operations +
+          # the launcher stdin reader thread), so console-getty on
+          # /dev/console is the headless analogue. Enable it, mask the
+          # impossible getty@tty1, and set root/root (shadow-override
+          # in the CI COPY only — the canonical base_image artifact
+          # stays pristine). Deterministic salt so the diff reviews.
+          sudo mkdir -p /mnt/m55a-rootfs/etc/systemd/system/getty.target.wants
+          sudo ln -sf /lib/systemd/system/console-getty.service \
+            /mnt/m55a-rootfs/etc/systemd/system/getty.target.wants/console-getty.service
+          sudo ln -sf /dev/null \
+            "/mnt/m55a-rootfs/etc/systemd/system/getty@tty1.service"
+          HASH=$(openssl passwd -6 -salt umlnt root)
+          sudo sed -i "s|^root:[^:]*:|root:${HASH}:|" \
+            /mnt/m55a-rootfs/etc/shadow
+          # USER ruling 2026-10 (M5.5b-1-AUTO): the death on the password
+          # path is not CI-specific — a real machine crashes the same way —
+          # and the kernel-mode hunt is deferred. So the milestone gate is
+          # reached by autologin: console-getty starts agetty with
+          # --autologin root, which skips the password round entirely. The
+          # gate grep is untouched: ^LOGIN-OK still has to appear, only the
+          # way we get to a shell changed (USER-approved semantics change).
+          sudo mkdir -p /mnt/m55a-rootfs/etc/systemd/system/console-getty.service.d
+          # Shelley 225: the binary that already runs well up to the
+          # password prompt is login itself, so the autologin belongs to it:
+          # -f root skips authentication and keeps everything else login
+          # does (pam_session, environment, the shell it spawns). agetty is
+          # out of the picture — it was exiting before it ever exec'd login.
+          printf '%s\n' \
+            '[Service]' \
+            'ExecStart=' \
+            'ExecStart=-/bin/login -f root' \
+            'StandardInput=tty' \
+            'TTYPath=/dev/console' \
+            'Restart=always' \
+            'RestartSec=0' \
+            | sudo tee /mnt/m55a-rootfs/etc/systemd/system/console-getty.service.d/autologin.conf >/dev/null
+          echo "--- M5.5b-1-AUTO autologin override ---"
+          cat /mnt/m55a-rootfs/etc/systemd/system/console-getty.service.d/autologin.conf
+          echo "--- M5.5b-1 login prep ---"
+          ls -l /mnt/m55a-rootfs/etc/systemd/system/getty.target.wants/ || true
+          grep "^root:" /mnt/m55a-rootfs/etc/shadow | cut -c1-14
+          sudo umount /mnt/m55a-rootfs
+          # D32: the mask ran to the end — the referee is armed.
+          echo "base_ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload masked rootfs (CI copy)
+        if: steps.mask.outputs.base_ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: m55a-rootfs-bookworm-masked
+          path: rootfs-img/base-debian-bookworm.img
+          retention-days: 3
+
+  winbuild:
+    # D33: the build half of the old launcher job — every step that
+    # needs no kernel artifact. One MSYS2 + one Go round builds the
+    # whole Windows toolset and uploads it ONCE; the four win-gates
+    # legs below download the same binaries instead of each rebuilding
+    # them. (The m55 referee still self-builds — by design.)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            make
+            mingw-w64-x86_64-toolchain
+
+      - name: Build launcher.exe + stub.exe
+        shell: msys2 {0}
+        run: |
+          make -C uml-nt/launcher all
+          make -C uml-nt/stub all
+
+      # M3.8 S4c evidence: musl TLS needs arch_prctl(ARCH_SET_FS) —
+      # can a user-written FS base exist on native Windows (FSGSBASE
+      # enabled, survives VEH round-trips / scheduling)? Evidence
+      # probe, not a gate: exit 0 with markers either way; D18 reads
+      # the log.
+      - name: FSGSBASE probe (S4c evidence)
+        shell: msys2 {0}
+        run: |
+          make -C uml-nt/probes
+          ./uml-nt/probes/fsgsbase.exe
+
+      # M4/S4d evidence: FP/XMM state at the VEH trap boundary —
+      # capture validity (CONTEXT.FloatSave), dispatcher clobber,
+      # writeback stickiness, round-trip fidelity. Decides how the
+      # stub captures/restores xstate for guest signals (sigreturn
+      # frame fpstate). Evidence probe, not a gate.
+      - name: XSTATE probe (S4d evidence)
+        shell: msys2 {0}
+        run: |
+          make -C uml-nt/probes
+          ./uml-nt/probes/xstate.exe
+
+      - name: Usage gate (no args → exit 2)
+        shell: msys2 {0}
+        run: |
+          cd uml-nt/launcher
+          set +e
+          ./launcher.exe; code=$?
+          set -e
+          [ "$code" -eq 2 ] || { echo "expected exit 2, got $code"; exit 1; }
+          echo "launcher usage gate ok"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      # M5.1b/c: the netstack helper — vdeplug-go compiled for the
+      # runner (netstack.exe, D8 direct p2p mode: tcplisten:// +
+      # slirp:// uplink). Committed go.mod/go.sum (the known-good
+      # floor; the old vdeplug_go.yml floater went with the D34
+      # consolidation — gVisor rides the pinned floor, dependabot
+      # floats the rest).
+      - name: Build netstack.exe (vdeplug-go, D8 helper)
+        # default (PowerShell) shell — setup-go's PATH doesn't reach
+        # the msys2 login environment, and the msys2 shell only
+        # consumes the artifact.
+        run: |
+          cd vdeplug-go
+          $env:CGO_ENABLED = '0'; $env:GOOS = 'windows'; $env:GOARCH = 'amd64'
+          go build -trimpath -ldflags='-s -w' -o ..\uml-nt\launcher\netstack.exe .
+          Get-Item ..\uml-nt\launcher\netstack.exe
+
+      # Shelley (vận hành): the real-machine user needs a matching-
+      # version download — every run uploads the SAME binaries the
+      # gates are about to consume. D33: the archive is now FLAT
+      # (launcher.exe, stub.exe, netstack.exe at the root) — unzip
+      # next to the kernel job's vmlinux.elf and run. always() = the
+      # set ships even when a build step went red (what built, built).
+      - name: Stage the flat windows toolset
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item uml-nt\launcher\launcher.exe dist\
+          Copy-Item uml-nt\launcher\netstack.exe dist\
+          Copy-Item uml-nt\stub\stub.exe dist\
+          Get-ChildItem dist | Format-Table Name,Length
+
+      - name: "Upload windows binaries (flat: launcher + stub + netstack)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uml-nt-windows-bin
+          path: dist
+          retention-days: 14
+          if-no-files-found: error
+
+  win-gates:
+    # D33: the gate half of the old launcher job — the 15 serial boot
+    # gates fanned out over four PARALLEL groups (public repo = the
+    # Windows concurrency is free), each leg running its slice of
+    # uml-nt/ci/gates.sh:
+    #   core  boot + mount + initexec   (the M1.9 -> M3.8 spine)
+    #   apps  bench + forkwait + canary + sigtest + heap + guard +
+    #         sysbench                 (the M4/M5.4 workload gates)
+    #   net   netprobe + net + portfwd  (the M5.1 family; portfwd
+    #         keeps its continue-on-error contract as a soft probe)
+    #   dyn   dynpie + dynlib + glibc  (the M5.4 D20 loader family)
+    # fail-fast: false — a red group never cancels its siblings
+    # mid-flight: evidence over redness. A re-run of a flaky group
+    # re-runs ONLY that group (the old job re-ran all 15).
+    needs: [kernel, winbuild]
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [core, apps, net, dyn]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same msys2 set as the old launcher job — identical environment,
+      # including the mingw runtime DLLs the downloaded launcher.exe
+      # and stub.exe link against.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            make
+            mingw-w64-x86_64-toolchain
+
+      - name: Download vmlinux.elf
+        uses: actions/download-artifact@v4
+        with:
+          name: uml-nt-vmlinux-elf
+          path: build
+
+      - name: Download guest-init.elf (M3.4)
+        uses: actions/download-artifact@v4
+        with:
+          name: uml-nt-guest-exec-elf
+          path: guest
+
+      - name: Download rootfs.ext4 (M3.5)
+        uses: actions/download-artifact@v4
+        with:
+          name: uml-nt-rootfs-ext4
+          path: rootfs
+
+      - name: Download windows binaries (winbuild)
+        uses: actions/download-artifact@v4
+        with:
+          name: uml-nt-windows-bin
+          path: winbin
+
+      # The layout contract gates.sh assumes — the exes go back where
+      # `make` put them in the old job, so every verbatim gate body's
+      # relative path (../../build/vmlinux, ../stub/stub.exe,
+      # ./launcher.exe) keeps resolving exactly as before.
+      - name: Place binaries
+        shell: msys2 {0}
+        run: |
+          cp winbin/launcher.exe winbin/netstack.exe uml-nt/launcher/
+          cp winbin/stub.exe uml-nt/stub/
+          ls -l uml-nt/launcher uml-nt/stub
+
+      - name: Run gate group (${{ matrix.group }})
+        shell: msys2 {0}
+        env:
+          # Shelley 256 (unchanged): the mini-debugger stays off by
+          # default — vars context does not reach repo scripts, so it
+          # rides the step env into gates.sh exactly as it rode the
+          # old boot-test step.
+          UML_NT_CIDBG: ${{ vars.UML_NT_CIDBG || '0' }}
+        run: bash uml-nt/ci/gates.sh ${{ matrix.group }}
+
+      - name: Upload gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-gates-${{ matrix.group }}-logs
+          path: uml-nt/launcher/*.log
+          retention-days: 14
+          if-no-files-found: warn
+
+  systemd-boot:
+    # The M5.5a/M5.5b referee (was uml-nt-m55-systemd.yml's boot job).
+    # Never on a plain push: dispatch (the A/B levers), the weekly
+    # canary, or the UML_NT_BOOT_ON_PUSH opt-in — see the header.
+    # D32: and never without a live base image — rootfs-mask reports
+    # base_ready, and a false skips this job instead of failing it on
+    # the mask-step's missing artifact.
+    if: >-
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || vars.UML_NT_BOOT_ON_PUSH == '1')
+      && needs.rootfs-mask.outputs.base_ready == 'true'
+    needs: [kernel, rootfs-mask]
+    runs-on: windows-latest
+    # 900s boot (1800s under the debugger lever) + the ETW window +
+    # dump collection; the platform default (360m) could burn six
+    # hours on a wedged collector.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            make
+            mingw-w64-x86_64-toolchain
+
+      - name: Build launcher.exe + stub.exe
+        shell: msys2 {0}
+        run: |
+          make -C uml-nt/launcher all
+          make -C uml-nt/stub all
+
+      - name: Download vmlinux.elf
+        uses: actions/download-artifact@v4
+        with:
+          name: uml-nt-vmlinux-elf
+          path: build
+
+      # The systemd rootfs = the kernel job's MASKED CI copy of
+      # base-debian-bookworm.img (Debian 12 cloud, systemd 252,
+      # root:root, getty@tty0, fstab /dev/ubda; cloud-init units masked
+      # per the D21 test-image rule). Never committed — hard rule.
+      - name: Download masked rootfs (CI copy)
+        uses: actions/download-artifact@v4
+        with:
+          name: m55a-rootfs-bookworm-masked
+          path: rootfs-img
+      - name: Verify masked rootfs landed
+        shell: msys2 {0}
+        run: ls -lh rootfs-img
+
+      - name: WER LocalDumps for stub.exe (diagnostics only)
+        shell: powershell
+        run: |
+          # Shelley 188: when a process dies unhandled, WER can write a
+          # dump that carries the REAL exception record — code, address
+          # and the thread context at death, including exceptions the
+          # user-mode handlers never saw. Diagnostics only; it does not
+          # touch the gate.
+          $dir = Join-Path $env:RUNNER_TEMP "uml-dumps"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $k = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\stub.exe"
+          New-Item -Path $k -Force | Out-Null
+          New-ItemProperty -Path $k -Name DumpFolder -Value $dir -PropertyType ExpandString -Force | Out-Null
+          New-ItemProperty -Path $k -Name DumpType -Value 2 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $k -Name DumpCount -Value 4 -PropertyType DWord -Force | Out-Null
+          Write-Host "LocalDumps -> $dir (Type=2 full)"
+
+      - name: NATIVE systemd boot (M5.5a + M5.5b-1 login feed)
+        shell: msys2 {0}
+        env:
+          # Shelley 219: a dump after the death never returns, so the stub
+          # photographs itself every two seconds and keeps the last three.
+          # the snapshots found no death to photograph and cost the run
+          # thousands of files; off while the gate is what matters.
+          UML_NT_DUMP_MS: "0"
+          # Shelley 242: census of every thread in the stub process, with
+          # start address and CPU time, so a thread that is not ours can be
+          # named instead of guessed at.
+          UML_NT_CENSUS: "1"
+        run: |
+          cd uml-nt/launcher
+          set +e
+          # 900s (was 420): mem=120M boots go deeper than the old cap
+          # could film — the evidence must land before the kill.
+          # SYSTEMD_LOG_TARGET=console: init's assert/emergency text
+          # defaults to the journald socket — silent when that path
+          # misbehaves ("Caught <ABRT>" with NO assertion line before
+          # it, run 36804503133). Console target puts the failing
+          # assert on the log we actually read.
+          #
+          # M5.5b-1: TRICKLE the login attempt every ~25s. Run
+          # 37009489525: a t=60s feed was GONE before the t~9min
+          # "uml login:" prompt (agetty's line setup flushes the
+          # queue) — pre-prompt attempts are flushed harmlessly, the
+          # first attempt after the prompt logs in, later ones are
+          # shell noise (echo LOGIN-OK is idempotent). The designed
+          # EOF "park loud" lands when the launcher dies.
+          WITNESS_ARG=""
+          if [ "${{ inputs.witness_off }}" = "true" ]; then
+            WITNESS_ARG="uml_nt_witness=0"
+          fi
+          XSLEV_ARG=""
+          if [ "${{ inputs.xs_lever }}" = "true" ]; then
+            XSLEV_ARG="uml_nt_xslever=1"
+          fi
+          PROBE_ARG=""
+          if [ "${{ inputs.probe_off }}" = "true" ]; then
+            PROBE_ARG="uml_nt_drexec=0"
+          fi
+          DBG_ARG=""
+          if [ "${{ inputs.debugger }}" = "true" ]; then
+            DBG_ARG="uml_nt_dbg=1"
+          fi
+          VW_ARG=""
+          if [ "${{ inputs.veh_window }}" = "true" ]; then
+            VW_ARG="uml_nt_vehwin=1"
+          fi
+          # Shelley 245: capture only the window that matters. The trace is
+          # armed the moment the kernel logs the login exec and stopped as
+          # soon as a death appears, so the file stays small enough to convert
+          # inside a step instead of dying on a hundred and twenty megabytes.
+          ETL=$(cygpath -w "$PWD/../uml-kproc.etl")
+          (
+            for _ in $(seq 1 600); do
+              if grep -q "login chain armed" systemd.log 2>/dev/null; then
+                logman.exe start umlnt -ets -p Microsoft-Windows-Kernel-Process 0x10 \
+                  -o "$ETL" -ct perf -f bin -max 64 -bs 64 -ft 1 >/dev/null 2>&1 \
+                  && echo "[etw] armed at $(date +%H:%M:%S)" >> etw-trace.log
+                break
+              fi
+              sleep 1
+            done
+            for _ in $(seq 1 900); do
+              if grep -q "died silently" systemd.log 2>/dev/null; then
+                sleep 2
+                logman.exe stop umlnt -ets >/dev/null 2>&1 \
+                  && echo "[etw] stopped at $(date +%H:%M:%S) (death seen)" >> etw-trace.log
+                exit 0
+              fi
+              sleep 1
+            done
+          ) &
+          ETW_WATCH=$!
+          {
+            i=0
+            while [ $i -lt 36 ]; do
+              if [ "${{ inputs.feed }}" != "false" ]; then
+                printf 'root\n'; sleep 1
+                printf 'root\n'; sleep 1
+                printf 'echo LOGIN-OK\n'
+                sleep 23
+              else
+                sleep 26
+              fi
+              i=$((i+1))
+            done
+          # -k 30: if the launcher ignores TERM we still get the log back —
+          # an instrument that can hang forever costs the whole run's
+          # evidence (referee 40794805029 lost everything at 1h01m).
+          } | timeout -k 30 ${{ inputs.debugger && '1800' || '900' }} ./launcher.exe ../../build/vmlinux \
+            "uml_nt_stub=$(cygpath -w "$(pwd)/../stub/stub.exe")" \
+            "ubd0=$(cygpath -w ../../rootfs-img/base-debian-bookworm.img)" \
+            "mem=120M" \
+            "root=98:0" "rw" \
+            "SYSTEMD_LOG_TARGET=console" "SYSTEMD_LOG_LOCATION=1" \
+            ${WITNESS_ARG:+$WITNESS_ARG} \
+            ${PROBE_ARG:+$PROBE_ARG} \
+            ${XSLEV_ARG:+$XSLEV_ARG} \
+            ${DBG_ARG:+$DBG_ARG} ${VW_ARG:+$VW_ARG} \
+            > systemd.log 2>&1
+          code=$?
+          set -e
+          logman.exe stop umlnt -ets >/dev/null 2>&1 || true
+          cat etw-trace.log 2>/dev/null || true
+          echo "launcher exit: $code (124 = still running at timeout — expected while systemd boots)"
+          echo "--- first 25 log lines (ubd attach / early boot) ---"
+          head -25 systemd.log
+          echo "--- exec chain ---"
+          grep -E "execve\(|binfmt_umlnt:" systemd.log | head -40 || true
+          # boot-failure-driven: the evidence table first.
+          echo "--- not-implemented syscall table (this boot) ---"
+          grep "not implemented" systemd.log \
+            | sed 's/^\[syscall\] nr=//; s/ not implemented.*//' \
+            | sort -n | uniq -c | sort -rn | head -40 || true
+          echo "--- last 30 log lines ---"
+          tail -30 systemd.log
+          echo "--- last console writes from the guest ---"
+          grep -E "^\[syscall\] (write|writev|openat|open|execve)" systemd.log | tail -25 || true
+          # Gate (D21 era): multi-user.target, fallback journald Started.
+          # The env-poison/_strv_env_merge SIGSEGV family still kills
+          # ~1/3 of boots pre-journald (COW-repair multi-page suspicion,
+          # hunt separate) — a red flake run is re-dispatched for
+          # sampling, not treated as a regression. Same ANSI-color
+          # lesson as below: "Started <color>Journal Service</color>."
+          # never matches the literal — match across the codes.
+          if grep -q "Reached target.*Multi-User System" systemd.log; then
+            echo "M5.5a GATE OK: multi-user.target reached"
+          elif grep -qE "Started.*Journal Service|Journal started" systemd.log; then
+            echo "M5.5a GATE OK (fallback): journald Started — multi-user not yet, read the evidence table above"
+          else
+            echo "M5.5a GATE MISS: neither multi-user.target nor journald Started — boot died before journald"
+            exit 1
+          fi
+          # M5.5b-1 gate (1/3): console-getty login root/root via PAM.
+          # The marker = the fed `echo LOGIN-OK` reaching the console
+          # log — a shell ran it, so getty + PAM auth + a login shell
+          # all worked. Same ANSI lesson: match at line start, the
+          # fed command's echo may colorize nothing (raw bytes in).
+          if grep -q "^LOGIN-OK" systemd.log; then
+            echo "M5.5b-1 GATE OK: root login via console-getty (PAM + shell)"
+          else
+            echo "M5.5b-1 GATE MISS: no LOGIN-OK marker — login did not complete (termios/ioctl ENOSYS hunt likely, read the syscall table)"
+            exit 1
+          fi
+          # M5.5b close rule (Shelley, after the "green" 36984931372
+          # died post-gate): a milestone-closing run may NOT die after
+          # the marker — the log from the marker on must be clean of
+          # kernel/guest death, or the boot ended only after the fed
+          # shell job completed (the designed park-loud EOF is fine).
+          MK=$(grep -n "^LOGIN-OK" systemd.log | head -1 | cut -d: -f1)
+          if [ -n "$MK" ] && tail -n +"$MK" systemd.log \
+              | grep -qE "Caught <|Freezing|KERNEL NATIVE FAULT"; then
+            echo "M5.5b GATE MISS: post-marker death in the log (the 36984931372 class) — a milestone cannot close on this run"
+            exit 1
+          fi
+          # Close procedure (not automatable here): the M5.5b gates
+          # must pass in TWO CONSECUTIVE runs before the milestone
+          # closes — re-dispatch and confirm, tracked in STATUS.
+
+      - name: Windows error events (faulting module + offset)
+        if: always()
+        shell: powershell
+        continue-on-error: true
+        run: |
+          # Shelley 246: WER dumps never appeared on this runner, but the
+          # Application log still records an event 1000 for an unhandled
+          # exception, and that record names the FAULTING MODULE and the
+          # offset inside it — the one fact seventeen dumps could not give.
+          $since = (Get-Date).AddMinutes(-40)
+          try {
+            $ev = Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000,1001; StartTime=$since} -ErrorAction Stop
+            Write-Host "app error events: $($ev.Count)"
+            foreach ($e in $ev | Select-Object -First 10) {
+              Write-Host "--- $($e.TimeCreated.ToString('o')) id=$($e.Id)"
+              Write-Host $e.Message
+            }
+          } catch { Write-Host "no application error events: $($_.Exception.Message)" }
+          try {
+            $ev2 = Get-WinEvent -FilterHashtable @{LogName='System'; Id=1000; StartTime=$since} -ErrorAction SilentlyContinue
+            foreach ($e in $ev2 | Select-Object -First 5) { Write-Host "sys1000 $($e.TimeCreated.ToString('o')) $($e.Message)" }
+          } catch { }
+
+      - name: ETW window (convert + find the victim)
+        if: always()
+        shell: powershell
+        timeout-minutes: 20
+        continue-on-error: true
+        run: |
+          # Shelley 245: the trace is now a window, not the whole boot, so a
+          # conversion fits in a step. The victim's pid is read from this
+          # run's own log and matched in BOTH spellings — a decimal pid and a
+          # hex pid have already caused one silent miss.
+          $etl = "uml-nt\uml-kproc.etl"
+          if (!(Test-Path $etl)) { Write-Host "no etl: $etl"; exit 0 }
+          Get-Item $etl | Format-List Name,Length | Out-String | Write-Host
+          logman query umlnt -ets 2>&1 | Out-String | Write-Host
+          $csv = Join-Path $env:RUNNER_TEMP "uml-kproc.csv"
+          tracerpt "$etl" -of CSV -o $csv -y 2>&1 | Select-Object -Last 2 | Out-String | Write-Host
+          if (!(Test-Path $csv)) { Write-Host "tracerpt produced no csv"; exit 0 }
+          $lines = Get-Content $csv
+          Write-Host "csv lines: $($lines.Count)"
+          $m = Select-String -Path "uml-nt\launcher\systemd.log" -Pattern 'exit-req\] pid (\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (!$m) { Write-Host "victim pid not found in the log"; exit 0 }
+          $dec = [int]$m.Matches[0].Groups[1].Value
+          $hex = '0x{0:X}' -f $dec
+          $hex4 = '0x{0:X4}' -f $dec
+          Write-Host "victim pid $dec ($hex / $hex4)"
+          $hits = $lines | Select-String -Pattern @($hex, $hex4, "\b$dec\b") -SimpleMatch:$false
+          Write-Host "victim rows: $($hits.Count)"
+          $hits | Select-Object -First 30 | ForEach-Object { Write-Host $_.Line }
+          $out = Join-Path $env:RUNNER_TEMP "uml-kproc-victim.txt"
+          $hits | ForEach-Object { $_.Line } | Set-Content $out
+          # the stop events of the last twenty seconds are the scene of the crime
+          Write-Host "--- last 20 Stop rows ---"
+          $lines | Select-String -Pattern ', *Stop *,' | Select-Object -Last 20 | ForEach-Object { Write-Host $_.Line }
+
+      - name: Upload systemd.log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m55a-systemd-log-${{ github.run_id }}
+          path: uml-nt/launcher/systemd.log
+
+      - name: Collect stub self-snapshots from %TEMP% (Windows temp, not runner.temp)
+        if: always()
+        shell: pwsh
+        run: |
+          $dst = "uml-nt/launcher"
+          $n = 0
+          # the msys2 TEMP is where the stub (a msys2 child) writes, and it is
+          # not $env:TEMP of this shell — collect from both
+          $globs = @("$env:TEMP\stub-loop-*.dmp","$env:TEMP\stub-death-*.dmp",
+                     "D:\a\_temp\msys64\tmp\stub-loop-*.dmp",
+                     "D:\a\_temp\msys64\tmp\stub-death-*.dmp")
+          Get-ChildItem $globs -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName -Destination $dst -Force
+            Write-Host "collected $($_.Name) $($_.Length) bytes"
+            $n++
+          }
+          Write-Host "stub snapshots collected: $n"
+
+      - name: Upload WER dumps + last-chance record (diagnostics)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m55a-wer-dumps-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/uml-dumps/*.dmp
+            ${{ runner.temp }}/stub-death-*.dmp
+            ${{ runner.temp }}/stub-loop-*.dmp
+            stub-death-*.dmp
+            stub-loop-*.dmp
+            uml-nt/launcher/stub-*.dmp
+            uml-nt/launcher/stub-unhandled.txt
+          if-no-files-found: warn
